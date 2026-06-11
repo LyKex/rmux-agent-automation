@@ -307,7 +307,16 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         .timeout(Duration::from_secs(30))
         .await?;
 
-    pane.keyboard().type_text(&prompt).await?;
+    let keyboard = pane.keyboard();
+    keyboard.type_text(&prompt).await?;
+    // type_text delivers the prompt as one literal blob; Claude's TUI treats it
+    // as a paste and coalesces it. Pressing Enter before that paste window closes
+    // gets absorbed as another newline instead of submitting, so wait for the
+    // pane to settle first, then submit.
+    pane.wait_until_stable_for(Duration::from_millis(500))
+        .timeout(Duration::from_secs(30))
+        .await?;
+    keyboard.press("Enter").await?;
 
     let exit_reason = wait_for_completion(&pane, &config.result_file, config.timeout).await;
     let final_visible_text = pane
@@ -413,6 +422,7 @@ fn write_trace(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>)
         lines.push(format!("rmux_bin={rmux_bin}"));
     }
     lines.push("prompt_send_event=sent_exact_prompt_file_bytes_via_keyboard".to_owned());
+    lines.push("prompt_submit_event=pressed_enter_after_prompt".to_owned());
     lines.push(format!(
         "result_file_exists={}",
         config.result_file.exists()
