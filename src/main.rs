@@ -386,7 +386,10 @@ fn claude_argv(
 ) -> Vec<String> {
     let mut argv = vec![
         claude_path.to_owned(),
-        "--bare".to_owned(),
+        // --bare is intentionally absent: it never reads OAuth/keychain
+        // credentials, so interactive logins fail. --safe-mode keeps the
+        // customization isolation (no CLAUDE.md, hooks, plugins, MCP) while
+        // auth works normally.
         "--safe-mode".to_owned(),
         "--disable-slash-commands".to_owned(),
         "--strict-mcp-config".to_owned(),
@@ -648,7 +651,7 @@ mod tests {
             &PermissionMode::AcceptEdits,
         );
         assert_eq!(argv[0], "/usr/bin/claude");
-        assert!(argv.contains(&"--bare".to_owned()));
+        assert!(!argv.contains(&"--bare".to_owned()));
         assert!(argv.contains(&"--safe-mode".to_owned()));
         assert!(argv.contains(&"--disable-slash-commands".to_owned()));
         assert!(argv.contains(&"--strict-mcp-config".to_owned()));
