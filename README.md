@@ -5,8 +5,20 @@ rmux-owned session, sends a prompt file, waits for a generic result marker,
 writes an audit trace, cleans up only the session it created, and prints one
 metadata JSON object to stdout.
 
+## Install
+
 ```sh
-cargo run -- \
+cargo install --path .
+```
+
+This builds a release binary and places it at `~/.cargo/bin/claude-rmux-runner`
+(make sure `~/.cargo/bin` is on your `PATH`). Re-run the command after code
+changes to update the installed binary.
+
+## Usage
+
+```sh
+claude-rmux-runner \
   --workspace /abs/path/to/workspace \
   --prompt-file /abs/path/to/prompt.txt \
   --result-file /abs/path/to/workspace/agent_result.json \
