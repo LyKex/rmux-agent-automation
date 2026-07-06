@@ -316,6 +316,7 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         .timeout(Duration::from_secs(30))
         .await?;
 
+    accept_workspace_trust_if_prompted(&pane).await?;
     send_and_submit_prompt(&pane, &prompt).await?;
 
     let exit_reason = wait_for_completion(&pane, &config.result_file, config.timeout).await;
@@ -336,6 +337,36 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         final_visible_text,
         final_output_dir,
     })
+}
+
+/// Accept Claude's workspace-trust dialog when a fresh, untrusted cwd triggers
+/// it. This must run before any prompt is pasted: the dialog only listens for
+/// its own keys, and the paste's `ESC` bytes would be read as an Escape/cancel.
+/// A trusted workspace shows no dialog, so this is a no-op there.
+async fn accept_workspace_trust_if_prompted(pane: &rmux_sdk::Pane) -> rmux_sdk::Result<()> {
+    const ATTEMPTS: usize = 6;
+
+    for _ in 0..ATTEMPTS {
+        let visible = pane
+            .snapshot()
+            .await
+            .map(|snapshot| snapshot.visible_text())
+            .unwrap_or_default();
+        if !has_trust_prompt(&visible) {
+            return Ok(());
+        }
+        // "Yes, I trust this folder" is the highlighted default; Enter confirms.
+        pane.keyboard().press("Enter").await?;
+        pane.wait_until_stable_for(Duration::from_millis(500))
+            .timeout(Duration::from_secs(30))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Whether the pane is showing the workspace-trust safety prompt.
+fn has_trust_prompt(visible_text: &str) -> bool {
+    visible_text.contains("trust this folder")
 }
 
 /// Paste the prompt into the TUI and submit it, confirming each step.
@@ -849,6 +880,17 @@ mod tests {
             ────────────";
         assert!(input_box_retains(collapsed, needle));
         assert!(input_box_retains(collapsed, ""));
+    }
+
+    #[test]
+    fn has_trust_prompt_detects_dialog() {
+        let dialog = "\
+            Quick safety check: Is this a project you created or one you trust?\n\
+            ❯ 1. Yes, I trust this folder\n\
+              2. No, exit\n\
+            Enter to confirm · Esc to cancel";
+        assert!(has_trust_prompt(dialog));
+        assert!(!has_trust_prompt("❯ Try \"write a test\""));
     }
 
     #[test]
