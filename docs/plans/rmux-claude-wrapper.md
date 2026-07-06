@@ -31,7 +31,7 @@ Optional CLI:
 
 Exit codes:
 
-- `0`: Claude finished and `agent_result.json` exists and is valid JSON.
+- `0`: Claude finished and the result file exists and names an output path that exists.
 - `1`: Claude exited or pane ended without a valid result.
 - `2`: timeout.
 - `3`: wrapper setup failure.
@@ -42,21 +42,21 @@ Exit codes:
 The wrapper must send the benchmark prompt exactly as provided in
 `--prompt-file`.
 
-The agent must be instructed by the prompt to write this JSON object to
-`--result-file`:
+The agent must be instructed by the prompt to write a plain-text result file at
+`--result-file` whose trimmed contents are the final output directory path:
 
-```json
-{
-  "final_output_dir": "/absolute/path/to/results"
-}
+```text
+/absolute/path/to/results
 ```
 
 After completion, the wrapper should verify that:
 
 - `--result-file` exists.
-- It is valid JSON.
-- `final_output_dir` is an absolute path.
-- `final_output_dir` exists and is a directory.
+- Its trimmed contents are a non-empty path.
+- That path exists on disk.
+
+The resolved path is surfaced as `final_output_dir` in the metadata and trace.
+The result file is not parsed as JSON.
 
 ## Isolation Requirements
 

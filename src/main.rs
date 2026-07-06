@@ -148,6 +148,7 @@ struct RunOutcome {
     pane: String,
     claude_command: Vec<String>,
     final_visible_text: String,
+    final_output_dir: Option<String>,
 }
 
 #[derive(Debug)]
@@ -185,6 +186,7 @@ struct Metadata {
     pane: String,
     result_file: String,
     result_file_exists: bool,
+    final_output_dir: Option<String>,
     exit_reason: ExitReason,
     exit_code: u8,
     claude_command: Vec<String>,
@@ -226,6 +228,7 @@ async fn main() -> ExitCode {
                 pane: "0:0".to_owned(),
                 claude_command: Vec::new(),
                 final_visible_text: String::new(),
+                final_output_dir: None,
             };
             let _ = write_trace(&config, &outcome, Some(&error.to_string()));
             eprintln!("setup failure: {error}");
@@ -324,6 +327,7 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         .await
         .map(|snapshot| snapshot.visible_text())
         .unwrap_or_default();
+    let final_output_dir = resolve_result_dir(&config.result_file);
 
     owned.cleanup().await?;
 
@@ -333,6 +337,7 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         pane: "0:0".to_owned(),
         claude_command,
         final_visible_text,
+        final_output_dir,
     })
 }
 
@@ -350,11 +355,11 @@ async fn wait_for_completion(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if result_file.exists() {
+                if result_is_complete(result_file) {
                     return ExitReason::Completed;
                 }
                 if pane_has_exited(pane).await.unwrap_or(true) {
-                    if result_file.exists() {
+                    if result_is_complete(result_file) {
                         return ExitReason::Completed;
                     }
                     return ExitReason::ClaudeExited;
@@ -364,6 +369,24 @@ async fn wait_for_completion(
             _ = &mut ctrl_c => return ExitReason::Interrupted,
         }
     }
+}
+
+/// The result file is a plain-text marker whose trimmed contents name the run's
+/// final output directory. A run counts as complete only when that file exists,
+/// holds a non-empty path, and that path exists on disk.
+fn result_is_complete(result_file: &Path) -> bool {
+    resolve_result_dir(result_file).is_some()
+}
+
+/// Read the final output directory recorded in the result file, returning it
+/// only when the file holds a non-empty path that exists on disk.
+fn resolve_result_dir(result_file: &Path) -> Option<String> {
+    let contents = fs::read_to_string(result_file).ok()?;
+    let path = contents.trim();
+    if path.is_empty() || !Path::new(path).exists() {
+        return None;
+    }
+    Some(path.to_owned())
 }
 
 async fn pane_has_exited(pane: &rmux_sdk::Pane) -> rmux_sdk::Result<bool> {
@@ -405,7 +428,7 @@ fn claude_argv(
 
 fn write_trace(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>) -> io::Result<()> {
     let mut lines = Vec::new();
-    lines.push(format!("timestamp={}", timestamp()));
+    lines.push(format!("timestamp={}", epoch_millis()));
     lines.push(format!("entrypoint={ENTRYPOINT}"));
     lines.push(format!("workspace={}", config.workspace.display()));
     lines.push(format!("prompt_file={}", config.prompt_file.display()));
@@ -430,6 +453,9 @@ fn write_trace(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>)
         "result_file_exists={}",
         config.result_file.exists()
     ));
+    if let Some(dir) = &outcome.final_output_dir {
+        lines.push(format!("final_output_dir={dir}"));
+    }
     lines.push(format!("exit_reason={:?}", outcome.exit_reason));
     lines.push(format!("exit_code={}", outcome.exit_reason.code()));
     if let Some(error) = setup_error {
@@ -450,6 +476,7 @@ fn metadata_for(config: &Config, outcome: &RunOutcome) -> Metadata {
         pane: outcome.pane.clone(),
         result_file: path_string(&config.result_file),
         result_file_exists: config.result_file.exists(),
+        final_output_dir: outcome.final_output_dir.clone(),
         exit_reason: outcome.exit_reason,
         exit_code: outcome.exit_reason.code(),
         claude_command: outcome.claude_command.clone(),
@@ -517,10 +544,6 @@ fn unique_session_name() -> String {
     )
 }
 
-fn timestamp() -> String {
-    format!("{}", epoch_millis())
-}
-
 fn epoch_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -532,7 +555,7 @@ fn resolve_executable(command: &str) -> Result<String, String> {
     let path = Path::new(command);
     if path.components().count() > 1 {
         return executable_path(path)
-            .map(path_to_string)
+            .map(|path| path_string(&path))
             .ok_or_else(|| format!("executable not found or not executable: {command}"));
     }
 
@@ -548,7 +571,7 @@ where
     for directory in directories {
         let candidate = directory.join(command);
         if let Some(path) = executable_path(&candidate) {
-            return Some(path_to_string(path));
+            return Some(path_string(&path));
         }
     }
     None
@@ -569,10 +592,6 @@ fn executable_path(path: &Path) -> Option<PathBuf> {
     }
 
     Some(path.to_path_buf())
-}
-
-fn path_to_string(path: PathBuf) -> String {
-    path.to_string_lossy().into_owned()
 }
 
 fn path_string(path: &Path) -> String {
@@ -682,12 +701,14 @@ mod tests {
             pane: "0:0".to_owned(),
             claude_command: vec!["claude".to_owned()],
             final_visible_text: String::new(),
+            final_output_dir: None,
         };
         let value = serde_json::to_value(metadata_for(&config, &outcome)).unwrap();
         assert_eq!(value["entrypoint"], ENTRYPOINT);
         assert_eq!(value["exit_code"], 2);
         assert_eq!(value["permission_mode"], "default");
         assert_eq!(value["result_file_exists"], false);
+        assert_eq!(value["final_output_dir"], serde_json::Value::Null);
     }
 
     #[test]
@@ -695,7 +716,7 @@ mod tests {
         let exe = env::current_exe().unwrap();
         assert_eq!(
             resolve_executable(exe.to_str().unwrap()).unwrap(),
-            path_to_string(exe)
+            path_string(&exe)
         );
     }
 
@@ -706,8 +727,40 @@ mod tests {
         let directory = exe.parent().unwrap().to_path_buf();
         assert_eq!(
             resolve_executable_in_path(&name, [directory]).unwrap(),
-            path_to_string(exe)
+            path_string(&exe)
         );
+    }
+
+    #[test]
+    fn result_is_complete_requires_existing_path_in_file() {
+        let dir = env::temp_dir().join(format!(
+            "claude-rmux-result-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let result_file = dir.join("agent_result.txt");
+
+        // Missing file.
+        assert!(!result_is_complete(&result_file));
+
+        // Empty / whitespace-only content.
+        fs::write(&result_file, "   \n").unwrap();
+        assert!(!result_is_complete(&result_file));
+
+        // Path that does not exist.
+        fs::write(&result_file, "/no/such/path/at/all").unwrap();
+        assert!(!result_is_complete(&result_file));
+
+        // Non-empty path that exists (the temp dir itself).
+        fs::write(&result_file, format!("{}\n", dir.display())).unwrap();
+        assert!(result_is_complete(&result_file));
+        assert_eq!(
+            resolve_result_dir(&result_file).as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

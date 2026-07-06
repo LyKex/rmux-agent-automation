@@ -39,11 +39,15 @@ Useful options:
 
 Exit codes:
 
-- `0`: `--result-file` exists.
-- `1`: Claude pane/process exited before the marker existed.
+- `0`: `--result-file` exists and its trimmed contents name a path that exists on disk.
+- `1`: Claude pane/process exited before a valid result marker appeared.
 - `2`: timeout.
 - `3`: setup, configuration, or validation failure.
 - `4`: interrupted or cancelled.
 
 The prompt file is sent as literal UTF-8 terminal input with no wrapper text.
-The result file is treated only as a marker file; it is not parsed as JSON.
+The result file is a plain-text marker: its trimmed contents are read as the
+run's final output directory. A run is complete only once that file holds a
+non-empty path that exists on disk. The resolved path is echoed back as
+`final_output_dir` in the metadata JSON and the trace. The file is never parsed
+as JSON.
