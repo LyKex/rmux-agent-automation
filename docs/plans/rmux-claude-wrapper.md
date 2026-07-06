@@ -110,6 +110,13 @@ The wrapper must write a trace file with enough information to audit the run:
 - transcript or captured terminal output
 - timeout or failure reason if any
 
+The captured terminal output is best effort: a single final visible frame of the
+pane, not the full conversation, and Claude's TUI may collapse a pasted prompt to
+a `[Pasted text #N +M lines]` placeholder in that frame. A structured transcript
+is not available — native JSON is a headless-mode feature, and interactive
+`--safe-mode` writes no session `.jsonl`. Treat `--prompt-file` as the source of
+truth for what was sent.
+
 It should also emit JSON metadata to stdout or a file if requested:
 
 ```json

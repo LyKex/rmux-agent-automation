@@ -51,3 +51,22 @@ run's final output directory. A run is complete only once that file holds a
 non-empty path that exists on disk. The resolved path is echoed back as
 `final_output_dir` in the metadata JSON and the trace. The file is never parsed
 as JSON.
+
+## Trace capture (best effort)
+
+The `--trace-file` records run metadata (session, Claude command, exit reason,
+resolved `final_output_dir`, timestamps) plus a `terminal_snapshot` block. That
+block is a **single final frame** of the pane's visible text, not the full
+conversation. It is best effort and has known limits:
+
+- The prompt may appear scrolled off or collapsed by Claude's TUI to a
+  `[Pasted text #N +M lines]` placeholder — so the snapshot is not a reliable
+  record of the exact prompt. Use your own `--prompt-file` as the source of
+  truth for what was sent.
+- It captures only the last visible screen, not scrollback.
+
+A structured, complete transcript is not available in this mode: Claude's native
+JSON output is a headless (`claude -p --output-format json`) feature, and this
+runner drives the interactive TUI on purpose. Interactive `--safe-mode` also
+writes no session `.jsonl` under `~/.claude/projects/`. For a taller final
+snapshot, run in a larger terminal.
