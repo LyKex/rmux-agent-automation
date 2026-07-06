@@ -14,6 +14,12 @@ use tokio::time::{self, Instant};
 
 const ENTRYPOINT: &str = "claude_interactive_rmux";
 const RMUX_DAEMON_BINARY_ENV: &str = "RMUX_SDK_DAEMON_BINARY";
+// Bracketed-paste envelope. The pane forwards send_text bytes literally, so a
+// bare newline in the prompt reads as Enter and submits a partial prompt.
+// Wrapping the payload in these markers tells Claude's TUI to buffer the whole
+// block — newlines included — as pasted content.
+const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
 #[derive(Debug, Parser)]
 #[command(name = "claude-rmux-runner")]
@@ -148,6 +154,7 @@ struct RunOutcome {
     pane: String,
     claude_command: Vec<String>,
     final_visible_text: String,
+    final_output_dir: Option<String>,
 }
 
 #[derive(Debug)]
@@ -185,6 +192,7 @@ struct Metadata {
     pane: String,
     result_file: String,
     result_file_exists: bool,
+    final_output_dir: Option<String>,
     exit_reason: ExitReason,
     exit_code: u8,
     claude_command: Vec<String>,
@@ -226,6 +234,7 @@ async fn main() -> ExitCode {
                 pane: "0:0".to_owned(),
                 claude_command: Vec::new(),
                 final_visible_text: String::new(),
+                final_output_dir: None,
             };
             let _ = write_trace(&config, &outcome, Some(&error.to_string()));
             eprintln!("setup failure: {error}");
@@ -307,16 +316,8 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         .timeout(Duration::from_secs(30))
         .await?;
 
-    let keyboard = pane.keyboard();
-    keyboard.type_text(&prompt).await?;
-    // type_text delivers the prompt as one literal blob; Claude's TUI treats it
-    // as a paste and coalesces it. Pressing Enter before that paste window closes
-    // gets absorbed as another newline instead of submitting, so wait for the
-    // pane to settle first, then submit.
-    pane.wait_until_stable_for(Duration::from_millis(500))
-        .timeout(Duration::from_secs(30))
-        .await?;
-    keyboard.press("Enter").await?;
+    accept_workspace_trust_if_prompted(&pane).await?;
+    send_and_submit_prompt(&pane, &prompt).await?;
 
     let exit_reason = wait_for_completion(&pane, &config.result_file, config.timeout).await;
     let final_visible_text = pane
@@ -324,6 +325,7 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         .await
         .map(|snapshot| snapshot.visible_text())
         .unwrap_or_default();
+    let final_output_dir = resolve_result_dir(&config.result_file);
 
     owned.cleanup().await?;
 
@@ -333,7 +335,110 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         pane: "0:0".to_owned(),
         claude_command,
         final_visible_text,
+        final_output_dir,
     })
+}
+
+/// Accept Claude's workspace-trust dialog when a fresh, untrusted cwd triggers
+/// it. This must run before any prompt is pasted: the dialog only listens for
+/// its own keys, and the paste's `ESC` bytes would be read as an Escape/cancel.
+/// A trusted workspace shows no dialog, so this is a no-op there.
+async fn accept_workspace_trust_if_prompted(pane: &rmux_sdk::Pane) -> rmux_sdk::Result<()> {
+    const ATTEMPTS: usize = 6;
+
+    for _ in 0..ATTEMPTS {
+        let visible = pane
+            .snapshot()
+            .await
+            .map(|snapshot| snapshot.visible_text())
+            .unwrap_or_default();
+        if !has_trust_prompt(&visible) {
+            return Ok(());
+        }
+        // "Yes, I trust this folder" is the highlighted default; Enter confirms.
+        pane.keyboard().press("Enter").await?;
+        pane.wait_until_stable_for(Duration::from_millis(500))
+            .timeout(Duration::from_secs(30))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Whether the pane is showing the workspace-trust safety prompt.
+fn has_trust_prompt(visible_text: &str) -> bool {
+    visible_text.contains("trust this folder")
+}
+
+/// Paste the prompt into the TUI and submit it, confirming each step.
+///
+/// The prompt is delivered inside a bracketed-paste envelope so embedded
+/// newlines land in the input buffer instead of submitting the prompt line by
+/// line. Two things are flaky while Claude's startup screen is still repainting:
+/// the paste can be dropped entirely, and an Enter can be absorbed as a newline
+/// rather than a submit. So we drive a small state machine off pane snapshots:
+/// re-paste until the prompt is actually sitting in the input box, then press
+/// Enter until that box clears (the prompt was accepted).
+async fn send_and_submit_prompt(pane: &rmux_sdk::Pane, prompt: &str) -> rmux_sdk::Result<()> {
+    const ATTEMPTS: usize = 12;
+
+    let keyboard = pane.keyboard();
+    let needle: String = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(24)
+        .collect();
+
+    // Let the startup screen finish drawing before the first paste.
+    pane.wait_until_stable_for(Duration::from_millis(500))
+        .timeout(Duration::from_secs(30))
+        .await?;
+    keyboard.type_text(bracketed_paste(prompt)).await?;
+
+    let mut landed = false;
+    for _ in 0..ATTEMPTS {
+        time::sleep(Duration::from_millis(600)).await;
+        let visible = pane
+            .snapshot()
+            .await
+            .map(|snapshot| snapshot.visible_text())
+            .unwrap_or_default();
+
+        if input_box_retains(&visible, &needle) {
+            // The prompt is in the input box; submit it (retry if a prior Enter
+            // was swallowed and the prompt is still sitting there).
+            landed = true;
+            keyboard.press("Enter").await?;
+        } else if landed {
+            // The prompt was in the box and is now gone → it was submitted.
+            return Ok(());
+        } else {
+            // The paste was dropped by a startup repaint. Clear any partial
+            // input and paste again.
+            keyboard.press("C-u").await?;
+            keyboard.type_text(bracketed_paste(prompt)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the prompt still sits unsent in the input box.
+///
+/// The input line carries the `❯` prompt marker; submitting clears it. A prompt
+/// that is still pending shows up on that line one of two ways: inline for a
+/// short prompt, or collapsed to a `[Pasted text #N +M lines]` placeholder for a
+/// multi-line paste. Only the input line uses the `❯` marker (the sent message
+/// is echoed back without it), so a marker line still carrying either form means
+/// the submit has not gone through.
+fn input_box_retains(visible_text: &str, needle: &str) -> bool {
+    visible_text
+        .lines()
+        .filter(|line| line.trim_start().starts_with('❯'))
+        .any(|line| {
+            line.contains("[Pasted text") || (!needle.is_empty() && line.contains(needle))
+        })
 }
 
 async fn wait_for_completion(
@@ -350,11 +455,11 @@ async fn wait_for_completion(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if result_file.exists() {
+                if result_is_complete(result_file) {
                     return ExitReason::Completed;
                 }
                 if pane_has_exited(pane).await.unwrap_or(true) {
-                    if result_file.exists() {
+                    if result_is_complete(result_file) {
                         return ExitReason::Completed;
                     }
                     return ExitReason::ClaudeExited;
@@ -364,6 +469,24 @@ async fn wait_for_completion(
             _ = &mut ctrl_c => return ExitReason::Interrupted,
         }
     }
+}
+
+/// The result file is a plain-text marker whose trimmed contents name the run's
+/// final output directory. A run counts as complete only when that file exists,
+/// holds a non-empty path, and that path exists on disk.
+fn result_is_complete(result_file: &Path) -> bool {
+    resolve_result_dir(result_file).is_some()
+}
+
+/// Read the final output directory recorded in the result file, returning it
+/// only when the file holds a non-empty path that exists on disk.
+fn resolve_result_dir(result_file: &Path) -> Option<String> {
+    let contents = fs::read_to_string(result_file).ok()?;
+    let path = contents.trim();
+    if path.is_empty() || !Path::new(path).exists() {
+        return None;
+    }
+    Some(path.to_owned())
 }
 
 async fn pane_has_exited(pane: &rmux_sdk::Pane) -> rmux_sdk::Result<bool> {
@@ -377,6 +500,10 @@ async fn pane_has_exited(pane: &rmux_sdk::Pane) -> rmux_sdk::Result<bool> {
         return Ok(true);
     };
     Ok(matches!(pane_info.process, PaneProcessState::Exited))
+}
+
+fn bracketed_paste(text: &str) -> String {
+    format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}")
 }
 
 fn claude_argv(
@@ -405,7 +532,7 @@ fn claude_argv(
 
 fn write_trace(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>) -> io::Result<()> {
     let mut lines = Vec::new();
-    lines.push(format!("timestamp={}", timestamp()));
+    lines.push(format!("timestamp={}", epoch_millis()));
     lines.push(format!("entrypoint={ENTRYPOINT}"));
     lines.push(format!("workspace={}", config.workspace.display()));
     lines.push(format!("prompt_file={}", config.prompt_file.display()));
@@ -424,12 +551,15 @@ fn write_trace(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>)
     if let Some(rmux_bin) = &config.rmux_bin {
         lines.push(format!("rmux_bin={rmux_bin}"));
     }
-    lines.push("prompt_send_event=sent_exact_prompt_file_bytes_via_keyboard".to_owned());
+    lines.push("prompt_send_event=sent_exact_prompt_file_bytes_via_bracketed_paste".to_owned());
     lines.push("prompt_submit_event=pressed_enter_after_prompt".to_owned());
     lines.push(format!(
         "result_file_exists={}",
         config.result_file.exists()
     ));
+    if let Some(dir) = &outcome.final_output_dir {
+        lines.push(format!("final_output_dir={dir}"));
+    }
     lines.push(format!("exit_reason={:?}", outcome.exit_reason));
     lines.push(format!("exit_code={}", outcome.exit_reason.code()));
     if let Some(error) = setup_error {
@@ -450,6 +580,7 @@ fn metadata_for(config: &Config, outcome: &RunOutcome) -> Metadata {
         pane: outcome.pane.clone(),
         result_file: path_string(&config.result_file),
         result_file_exists: config.result_file.exists(),
+        final_output_dir: outcome.final_output_dir.clone(),
         exit_reason: outcome.exit_reason,
         exit_code: outcome.exit_reason.code(),
         claude_command: outcome.claude_command.clone(),
@@ -517,10 +648,6 @@ fn unique_session_name() -> String {
     )
 }
 
-fn timestamp() -> String {
-    format!("{}", epoch_millis())
-}
-
 fn epoch_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -532,7 +659,7 @@ fn resolve_executable(command: &str) -> Result<String, String> {
     let path = Path::new(command);
     if path.components().count() > 1 {
         return executable_path(path)
-            .map(path_to_string)
+            .map(|path| path_string(&path))
             .ok_or_else(|| format!("executable not found or not executable: {command}"));
     }
 
@@ -548,7 +675,7 @@ where
     for directory in directories {
         let candidate = directory.join(command);
         if let Some(path) = executable_path(&candidate) {
-            return Some(path_to_string(path));
+            return Some(path_string(&path));
         }
     }
     None
@@ -569,10 +696,6 @@ fn executable_path(path: &Path) -> Option<PathBuf> {
     }
 
     Some(path.to_path_buf())
-}
-
-fn path_to_string(path: PathBuf) -> String {
-    path.to_string_lossy().into_owned()
 }
 
 fn path_string(path: &Path) -> String {
@@ -682,12 +805,14 @@ mod tests {
             pane: "0:0".to_owned(),
             claude_command: vec!["claude".to_owned()],
             final_visible_text: String::new(),
+            final_output_dir: None,
         };
         let value = serde_json::to_value(metadata_for(&config, &outcome)).unwrap();
         assert_eq!(value["entrypoint"], ENTRYPOINT);
         assert_eq!(value["exit_code"], 2);
         assert_eq!(value["permission_mode"], "default");
         assert_eq!(value["result_file_exists"], false);
+        assert_eq!(value["final_output_dir"], serde_json::Value::Null);
     }
 
     #[test]
@@ -695,7 +820,7 @@ mod tests {
         let exe = env::current_exe().unwrap();
         assert_eq!(
             resolve_executable(exe.to_str().unwrap()).unwrap(),
-            path_to_string(exe)
+            path_string(&exe)
         );
     }
 
@@ -706,8 +831,98 @@ mod tests {
         let directory = exe.parent().unwrap().to_path_buf();
         assert_eq!(
             resolve_executable_in_path(&name, [directory]).unwrap(),
-            path_to_string(exe)
+            path_string(&exe)
         );
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_prompt_with_markers() {
+        let wrapped = bracketed_paste("line one\nline two");
+        assert_eq!(wrapped, "\u{1b}[200~line one\nline two\u{1b}[201~");
+        assert!(wrapped.starts_with(BRACKETED_PASTE_START));
+        assert!(wrapped.ends_with(BRACKETED_PASTE_END));
+        // The prompt bytes, including the embedded newline, survive verbatim.
+        assert!(wrapped.contains("line one\nline two"));
+    }
+
+    #[test]
+    fn input_box_retains_detects_unsent_prompt() {
+        let needle = "You are running inside";
+        // Prompt still sitting in the input box (marker line at the bottom).
+        let pending = "\
+            some transcript above\n\
+            ────────────\n\
+            ❯ You are running inside a fresh workspace\n\
+              do exactly these steps\n\
+            ────────────";
+        assert!(input_box_retains(pending, needle));
+
+        // Submitted: input box cleared to its placeholder. The sent message is
+        // echoed back higher up in the transcript, but without the ❯ marker, so
+        // it must not be mistaken for pending input.
+        let submitted = "\
+            > You are running inside a fresh workspace (sent message echo)\n\
+            ... assistant working ...\n\
+            ────────────\n\
+            ❯ Try \"write a test\"\n\
+            ────────────";
+        assert!(!input_box_retains(submitted, needle));
+
+        // Empty needle never matches an inline prompt.
+        assert!(!input_box_retains(pending, ""));
+
+        // A multi-line paste is collapsed to a placeholder on the input line;
+        // that still counts as pending even without the needle text.
+        let collapsed = "\
+            ... assistant idle ...\n\
+            ────────────\n\
+            ❯ [Pasted text #1 +7 lines]\n\
+            ────────────";
+        assert!(input_box_retains(collapsed, needle));
+        assert!(input_box_retains(collapsed, ""));
+    }
+
+    #[test]
+    fn has_trust_prompt_detects_dialog() {
+        let dialog = "\
+            Quick safety check: Is this a project you created or one you trust?\n\
+            ❯ 1. Yes, I trust this folder\n\
+              2. No, exit\n\
+            Enter to confirm · Esc to cancel";
+        assert!(has_trust_prompt(dialog));
+        assert!(!has_trust_prompt("❯ Try \"write a test\""));
+    }
+
+    #[test]
+    fn result_is_complete_requires_existing_path_in_file() {
+        let dir = env::temp_dir().join(format!(
+            "claude-rmux-result-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let result_file = dir.join("agent_result.txt");
+
+        // Missing file.
+        assert!(!result_is_complete(&result_file));
+
+        // Empty / whitespace-only content.
+        fs::write(&result_file, "   \n").unwrap();
+        assert!(!result_is_complete(&result_file));
+
+        // Path that does not exist.
+        fs::write(&result_file, "/no/such/path/at/all").unwrap();
+        assert!(!result_is_complete(&result_file));
+
+        // Non-empty path that exists (the temp dir itself).
+        fs::write(&result_file, format!("{}\n", dir.display())).unwrap();
+        assert!(result_is_complete(&result_file));
+        assert_eq!(
+            resolve_result_dir(&result_file).as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

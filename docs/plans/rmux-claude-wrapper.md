@@ -31,7 +31,7 @@ Optional CLI:
 
 Exit codes:
 
-- `0`: Claude finished and `agent_result.json` exists and is valid JSON.
+- `0`: Claude finished and the result file exists and names an output path that exists.
 - `1`: Claude exited or pane ended without a valid result.
 - `2`: timeout.
 - `3`: wrapper setup failure.
@@ -42,21 +42,21 @@ Exit codes:
 The wrapper must send the benchmark prompt exactly as provided in
 `--prompt-file`.
 
-The agent must be instructed by the prompt to write this JSON object to
-`--result-file`:
+The agent must be instructed by the prompt to write a plain-text result file at
+`--result-file` whose trimmed contents are the final output directory path:
 
-```json
-{
-  "final_output_dir": "/absolute/path/to/results"
-}
+```text
+/absolute/path/to/results
 ```
 
 After completion, the wrapper should verify that:
 
 - `--result-file` exists.
-- It is valid JSON.
-- `final_output_dir` is an absolute path.
-- `final_output_dir` exists and is a directory.
+- Its trimmed contents are a non-empty path.
+- That path exists on disk.
+
+The resolved path is surfaced as `final_output_dir` in the metadata and trace.
+The result file is not parsed as JSON.
 
 ## Isolation Requirements
 
@@ -109,6 +109,13 @@ The wrapper must write a trace file with enough information to audit the run:
 - rmux session or pane id
 - transcript or captured terminal output
 - timeout or failure reason if any
+
+The captured terminal output is best effort: a single final visible frame of the
+pane, not the full conversation, and Claude's TUI may collapse a pasted prompt to
+a `[Pasted text #N +M lines]` placeholder in that frame. A structured transcript
+is not available — native JSON is a headless-mode feature, and interactive
+`--safe-mode` writes no session `.jsonl`. Treat `--prompt-file` as the source of
+truth for what was sent.
 
 It should also emit JSON metadata to stdout or a file if requested:
 

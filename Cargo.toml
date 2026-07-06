@@ -2,6 +2,12 @@
 name = "claude-rmux-runner"
 version = "0.1.0"
 edition = "2021"
+description = "Standalone runner that drives an interactive Claude session inside a fresh rmux-owned session, sends a prompt file, waits for a result marker, and emits an audit trace and metadata JSON."
+license = "MIT"
+repository = "https://github.com/LyKex/rmux-agent-automation"
+readme = "README.md"
+keywords = ["claude", "rmux", "agent", "automation", "benchmark"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
