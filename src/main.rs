@@ -14,6 +14,12 @@ use tokio::time::{self, Instant};
 
 const ENTRYPOINT: &str = "claude_interactive_rmux";
 const RMUX_DAEMON_BINARY_ENV: &str = "RMUX_SDK_DAEMON_BINARY";
+// Bracketed-paste envelope. The pane forwards send_text bytes literally, so a
+// bare newline in the prompt reads as Enter and submits a partial prompt.
+// Wrapping the payload in these markers tells Claude's TUI to buffer the whole
+// block — newlines included — as pasted content.
+const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
 #[derive(Debug, Parser)]
 #[command(name = "claude-rmux-runner")]
@@ -310,16 +316,7 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         .timeout(Duration::from_secs(30))
         .await?;
 
-    let keyboard = pane.keyboard();
-    keyboard.type_text(&prompt).await?;
-    // type_text delivers the prompt as one literal blob; Claude's TUI treats it
-    // as a paste and coalesces it. Pressing Enter before that paste window closes
-    // gets absorbed as another newline instead of submitting, so wait for the
-    // pane to settle first, then submit.
-    pane.wait_until_stable_for(Duration::from_millis(500))
-        .timeout(Duration::from_secs(30))
-        .await?;
-    keyboard.press("Enter").await?;
+    send_and_submit_prompt(&pane, &prompt).await?;
 
     let exit_reason = wait_for_completion(&pane, &config.result_file, config.timeout).await;
     let final_visible_text = pane
@@ -339,6 +336,78 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         final_visible_text,
         final_output_dir,
     })
+}
+
+/// Paste the prompt into the TUI and submit it, confirming each step.
+///
+/// The prompt is delivered inside a bracketed-paste envelope so embedded
+/// newlines land in the input buffer instead of submitting the prompt line by
+/// line. Two things are flaky while Claude's startup screen is still repainting:
+/// the paste can be dropped entirely, and an Enter can be absorbed as a newline
+/// rather than a submit. So we drive a small state machine off pane snapshots:
+/// re-paste until the prompt is actually sitting in the input box, then press
+/// Enter until that box clears (the prompt was accepted).
+async fn send_and_submit_prompt(pane: &rmux_sdk::Pane, prompt: &str) -> rmux_sdk::Result<()> {
+    const ATTEMPTS: usize = 12;
+
+    let keyboard = pane.keyboard();
+    let needle: String = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(24)
+        .collect();
+
+    // Let the startup screen finish drawing before the first paste.
+    pane.wait_until_stable_for(Duration::from_millis(500))
+        .timeout(Duration::from_secs(30))
+        .await?;
+    keyboard.type_text(bracketed_paste(prompt)).await?;
+
+    let mut landed = false;
+    for _ in 0..ATTEMPTS {
+        time::sleep(Duration::from_millis(600)).await;
+        let visible = pane
+            .snapshot()
+            .await
+            .map(|snapshot| snapshot.visible_text())
+            .unwrap_or_default();
+
+        if input_box_retains(&visible, &needle) {
+            // The prompt is in the input box; submit it (retry if a prior Enter
+            // was swallowed and the prompt is still sitting there).
+            landed = true;
+            keyboard.press("Enter").await?;
+        } else if landed {
+            // The prompt was in the box and is now gone → it was submitted.
+            return Ok(());
+        } else {
+            // The paste was dropped by a startup repaint. Clear any partial
+            // input and paste again.
+            keyboard.press("C-u").await?;
+            keyboard.type_text(bracketed_paste(prompt)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the prompt still sits unsent in the input box.
+///
+/// The input line carries the `❯` prompt marker; submitting clears it. A prompt
+/// that is still pending shows up on that line one of two ways: inline for a
+/// short prompt, or collapsed to a `[Pasted text #N +M lines]` placeholder for a
+/// multi-line paste. Only the input line uses the `❯` marker (the sent message
+/// is echoed back without it), so a marker line still carrying either form means
+/// the submit has not gone through.
+fn input_box_retains(visible_text: &str, needle: &str) -> bool {
+    visible_text
+        .lines()
+        .filter(|line| line.trim_start().starts_with('❯'))
+        .any(|line| {
+            line.contains("[Pasted text") || (!needle.is_empty() && line.contains(needle))
+        })
 }
 
 async fn wait_for_completion(
@@ -402,6 +471,10 @@ async fn pane_has_exited(pane: &rmux_sdk::Pane) -> rmux_sdk::Result<bool> {
     Ok(matches!(pane_info.process, PaneProcessState::Exited))
 }
 
+fn bracketed_paste(text: &str) -> String {
+    format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}")
+}
+
 fn claude_argv(
     claude_path: &str,
     model: Option<&str>,
@@ -447,7 +520,7 @@ fn write_trace(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>)
     if let Some(rmux_bin) = &config.rmux_bin {
         lines.push(format!("rmux_bin={rmux_bin}"));
     }
-    lines.push("prompt_send_event=sent_exact_prompt_file_bytes_via_keyboard".to_owned());
+    lines.push("prompt_send_event=sent_exact_prompt_file_bytes_via_bracketed_paste".to_owned());
     lines.push("prompt_submit_event=pressed_enter_after_prompt".to_owned());
     lines.push(format!(
         "result_file_exists={}",
@@ -729,6 +802,53 @@ mod tests {
             resolve_executable_in_path(&name, [directory]).unwrap(),
             path_string(&exe)
         );
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_prompt_with_markers() {
+        let wrapped = bracketed_paste("line one\nline two");
+        assert_eq!(wrapped, "\u{1b}[200~line one\nline two\u{1b}[201~");
+        assert!(wrapped.starts_with(BRACKETED_PASTE_START));
+        assert!(wrapped.ends_with(BRACKETED_PASTE_END));
+        // The prompt bytes, including the embedded newline, survive verbatim.
+        assert!(wrapped.contains("line one\nline two"));
+    }
+
+    #[test]
+    fn input_box_retains_detects_unsent_prompt() {
+        let needle = "You are running inside";
+        // Prompt still sitting in the input box (marker line at the bottom).
+        let pending = "\
+            some transcript above\n\
+            ────────────\n\
+            ❯ You are running inside a fresh workspace\n\
+              do exactly these steps\n\
+            ────────────";
+        assert!(input_box_retains(pending, needle));
+
+        // Submitted: input box cleared to its placeholder. The sent message is
+        // echoed back higher up in the transcript, but without the ❯ marker, so
+        // it must not be mistaken for pending input.
+        let submitted = "\
+            > You are running inside a fresh workspace (sent message echo)\n\
+            ... assistant working ...\n\
+            ────────────\n\
+            ❯ Try \"write a test\"\n\
+            ────────────";
+        assert!(!input_box_retains(submitted, needle));
+
+        // Empty needle never matches an inline prompt.
+        assert!(!input_box_retains(pending, ""));
+
+        // A multi-line paste is collapsed to a placeholder on the input line;
+        // that still counts as pending even without the needle text.
+        let collapsed = "\
+            ... assistant idle ...\n\
+            ────────────\n\
+            ❯ [Pasted text #1 +7 lines]\n\
+            ────────────";
+        assert!(input_box_retains(collapsed, needle));
+        assert!(input_box_retains(collapsed, ""));
     }
 
     #[test]
