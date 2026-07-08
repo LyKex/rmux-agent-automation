@@ -22,7 +22,7 @@ claude-rmux-runner \
   --workspace /abs/path/to/workspace \
   --prompt-file /abs/path/to/prompt.txt \
   --result-file /abs/path/to/workspace/agent_result.json \
-  --trace-file /abs/path/to/run/agent_trace.log \
+  --trace-file /abs/path/to/run/meta.json \
   --timeout-seconds 3600
 ```
 
@@ -33,6 +33,7 @@ Useful options:
 --session-name <name>
 --claude-bin <path-or-command>
 --rmux-bin <path-or-command>
+--transcript-file /abs/path/to/run/trace.jsonl
 --final-message-file /abs/path/to/run/final_message.txt
 --permission-mode acceptEdits|bypassPermissions|default
 ```
@@ -52,21 +53,44 @@ non-empty path that exists on disk. The resolved path is echoed back as
 `final_output_dir` in the metadata JSON and the trace. The file is never parsed
 as JSON.
 
-## Trace capture (best effort)
+## Trace capture
 
-The `--trace-file` records run metadata (session, Claude command, exit reason,
-resolved `final_output_dir`, timestamps) plus a `terminal_snapshot` block. That
-block is a **single final frame** of the pane's visible text, not the full
-conversation. It is best effort and has known limits:
+Each run emits **two artifacts**:
 
-- The prompt may appear scrolled off or collapsed by Claude's TUI to a
-  `[Pasted text #N +M lines]` placeholder — so the snapshot is not a reliable
-  record of the exact prompt. Use your own `--prompt-file` as the source of
-  truth for what was sent.
-- It captures only the last visible screen, not scrollback.
+1. **Metadata** (`--trace-file`) — one JSON object with the full run record:
+   session, `claude_session_id`, `claude_command`, `permission_mode`,
+   `exit_reason`/`exit_code`, resolved `final_output_dir`, timestamps, and the
+   `transcript_*` fields below. This is the **same object printed to stdout** —
+   the file just persists it, so you no longer need to capture stdout separately.
+2. **Transcript** (`--transcript-file`, default `trace.jsonl` beside the
+   metadata file) — the **real Claude session transcript**, a valid `.jsonl` of
+   the full turn-by-turn conversation (user prompt, assistant thinking, every
+   `tool_use`/`tool_result`) copied verbatim from what Claude writes under its
+   projects config dir.
 
-A structured, complete transcript is not available in this mode: Claude's native
-JSON output is a headless (`claude -p --output-format json`) feature, and this
-runner drives the interactive TUI on purpose. Interactive `--safe-mode` also
-writes no session `.jsonl` under `~/.claude/projects/`. For a taller final
-snapshot, run in a larger terminal.
+The metadata's `transcript_source` says which was captured: `session_jsonl` (the
+real transcript), `terminal_snapshot` (fallback), or `none`. `transcript_file`
+is the copy's path; `transcript_jsonl_path` is the on-disk source Claude wrote.
+
+How the real transcript is captured despite driving the interactive TUI (not
+headless `-p --output-format json`):
+
+- The runner forces `--session-id <uuid>`, so it knows the exact
+  `<uuid>.jsonl` to harvest after the run — no path munging needed.
+- Interactive Claude flushes that transcript incrementally, but **suppresses it
+  for nested/child sessions**: when the runner itself runs under a Claude
+  session, the spawned Claude inherits `CLAUDE_CODE_CHILD_SESSION` /
+  `CLAUDECODE` and writes no transcript. The runner therefore spawns Claude
+  through `env -u …`, clearing those vars so a normal session is persisted.
+- Before teardown the runner quits Claude cleanly (Ctrl-C) so the final turn is
+  flushed; this appends a trailing `[Request interrupted by user]` record.
+
+**Fallback.** If the transcript file cannot be located or read
+(`transcript_source` = `terminal_snapshot`), `--transcript-file` instead holds a
+single JSON line `{"type":"terminal_snapshot","text":…}` wrapping the pane's
+final visible frame (last screen only, no scrollback; the prompt may be
+collapsed to a `[Pasted text #N +M lines]` placeholder). Use your own
+`--prompt-file` as the source of truth for what was sent.
+
+If the operator sets `CLAUDE_CONFIG_DIR`, the runner honors it when locating the
+transcript.

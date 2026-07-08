@@ -20,6 +20,18 @@ const RMUX_DAEMON_BINARY_ENV: &str = "RMUX_SDK_DAEMON_BINARY";
 // block — newlines included — as pasted content.
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+// Env vars Claude Code sets for processes it spawns. When the runner itself runs
+// under a Claude session, a nested Claude inherits these, detects a *child*
+// session, and suppresses its on-disk `<id>.jsonl` transcript — the very file we
+// harvest. We unset them for the spawned Claude so it persists a normal session.
+const CLAUDE_NESTING_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_EFFORT",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "claude-rmux-runner")]
@@ -31,8 +43,14 @@ struct Cli {
     prompt_file: PathBuf,
     #[arg(long)]
     result_file: PathBuf,
+    /// Merged run metadata, written as the same JSON object printed to stdout.
     #[arg(long)]
     trace_file: PathBuf,
+    /// Raw session transcript copy (`.jsonl`). Defaults to `trace.jsonl` beside
+    /// `--trace-file`. Holds Claude's real `<id>.jsonl`, or — as a fallback — a
+    /// single JSON line wrapping the final terminal snapshot.
+    #[arg(long)]
+    transcript_file: Option<PathBuf>,
     #[arg(long)]
     timeout_seconds: u64,
     #[arg(long)]
@@ -97,6 +115,7 @@ struct Config {
     prompt_file: PathBuf,
     result_file: PathBuf,
     trace_file: PathBuf,
+    transcript_file: PathBuf,
     timeout: Duration,
     model: Option<String>,
     session_name: String,
@@ -104,6 +123,9 @@ struct Config {
     rmux_bin: Option<String>,
     final_message_file: Option<PathBuf>,
     permission_mode: PermissionMode,
+    // Session id we force on Claude with `--session-id`, so we can locate the
+    // exact `<id>.jsonl` transcript it writes under the projects config dir.
+    claude_session_id: String,
 }
 
 impl Config {
@@ -122,17 +144,34 @@ impl Config {
         {
             ensure_directory(parent, "--trace-file parent")?;
         }
+        if let Some(path) = &cli.transcript_file {
+            if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+                ensure_directory(parent, "--transcript-file parent")?;
+            }
+        }
         if let Some(path) = &cli.final_message_file {
             if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
                 ensure_directory(parent, "--final-message-file parent")?;
             }
         }
 
+        let trace_file = absolutize_maybe_missing(cli.trace_file)?;
+        // Default the transcript beside the metadata file so a single --trace-file
+        // still yields both artifacts.
+        let transcript_file = match cli.transcript_file {
+            Some(path) => absolutize_maybe_missing(path)?,
+            None => trace_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("trace.jsonl"),
+        };
+
         Ok(Self {
             workspace: absolutize_existing(cli.workspace)?,
             prompt_file: absolutize_existing(cli.prompt_file)?,
             result_file: absolutize_maybe_missing(cli.result_file)?,
-            trace_file: absolutize_maybe_missing(cli.trace_file)?,
+            trace_file,
+            transcript_file,
             timeout: Duration::from_secs(cli.timeout_seconds),
             model: cli.model,
             session_name: cli.session_name.unwrap_or_else(unique_session_name),
@@ -143,6 +182,7 @@ impl Config {
                 .map(absolutize_maybe_missing)
                 .transpose()?,
             permission_mode: cli.permission_mode,
+            claude_session_id: new_uuid(),
         })
     }
 }
@@ -155,6 +195,11 @@ struct RunOutcome {
     claude_command: Vec<String>,
     final_visible_text: String,
     final_output_dir: Option<String>,
+    // Real Claude session transcript, harvested from `<id>.jsonl` after the run.
+    // `None` when the file could not be located/read (trace falls back to the
+    // terminal snapshot).
+    transcript_path: Option<PathBuf>,
+    transcript_text: Option<String>,
 }
 
 #[derive(Debug)]
@@ -184,19 +229,34 @@ impl From<io::Error> for SetupError {
     }
 }
 
+/// The single merged run record: printed to stdout and written verbatim to
+/// `--trace-file`. Supersedes the old key=value trace log. The transcript itself
+/// is not embedded here — it lives in `--transcript-file` (see `transcript_*`).
 #[derive(Serialize)]
 struct Metadata {
     entrypoint: &'static str,
+    timestamp_ms: u128,
     workspace: String,
-    session: String,
-    pane: String,
+    prompt_file: String,
     result_file: String,
     result_file_exists: bool,
     final_output_dir: Option<String>,
+    session: String,
+    claude_session_id: String,
+    pane: String,
+    permission_mode: String,
+    claude_command: Vec<String>,
+    rmux_bin: Option<String>,
+    prompt_send_event: &'static str,
+    prompt_submit_event: &'static str,
     exit_reason: ExitReason,
     exit_code: u8,
-    claude_command: Vec<String>,
-    permission_mode: String,
+    setup_error: Option<String>,
+    // Where the runner wrote the transcript copy, its on-disk source (Claude's
+    // `<id>.jsonl`), and which of the two got captured.
+    transcript_file: String,
+    transcript_jsonl_path: Option<String>,
+    transcript_source: &'static str,
     isolation_notes: Vec<String>,
 }
 
@@ -235,30 +295,33 @@ async fn main() -> ExitCode {
                 claude_command: Vec::new(),
                 final_visible_text: String::new(),
                 final_output_dir: None,
+                transcript_path: None,
+                transcript_text: None,
             };
-            let _ = write_trace(&config, &outcome, Some(&error.to_string()));
             eprintln!("setup failure: {error}");
-            emit_metadata_and_exit(&config, &outcome, false);
+            emit(&config, &outcome, Some(&error.to_string()));
             return ExitCode::from(outcome.exit_reason.code());
         }
     };
 
-    emit_metadata_and_exit(&config, &outcome, true);
+    emit(&config, &outcome, None);
     ExitCode::from(outcome.exit_reason.code())
 }
 
-fn emit_metadata_and_exit(config: &Config, outcome: &RunOutcome, write_clean_trace: bool) {
+/// Write all run artifacts: the transcript `.jsonl` copy, then the merged
+/// metadata JSON — printed to stdout and written verbatim to `--trace-file`.
+fn emit(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>) {
     if let Some(path) = &config.final_message_file {
         let _ = fs::write(path, &outcome.final_visible_text);
     }
 
-    if write_clean_trace {
-        let _ = write_trace(config, outcome, None);
-    }
-
-    let metadata = metadata_for(config, outcome);
+    let transcript_source = write_transcript_file(config, outcome);
+    let metadata = metadata_for(config, outcome, setup_error, transcript_source);
     match serde_json::to_string(&metadata) {
-        Ok(json) => println!("{json}"),
+        Ok(json) => {
+            println!("{json}");
+            let _ = fs::write(&config.trace_file, format!("{json}\n"));
+        }
         Err(error) => eprintln!("metadata serialization failure: {error}"),
     }
 }
@@ -287,11 +350,12 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
             format!("--prompt-file must contain UTF-8 text for rmux keyboard input: {error}"),
         )
     })?;
-    let claude_command = claude_argv(
+    let claude_command = spawn_command(claude_argv(
         &claude_path,
         config.model.as_deref(),
         &config.permission_mode,
-    );
+        &config.claude_session_id,
+    ));
 
     let rmux = Rmux::builder()
         .default_timeout(Duration::from_secs(10))
@@ -327,7 +391,16 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         .unwrap_or_default();
     let final_output_dir = resolve_result_dir(&config.result_file);
 
+    // Interactive Claude flushes its `<id>.jsonl` transcript on graceful exit,
+    // not on the SIGKILL that session teardown delivers. Quit Claude cleanly and
+    // wait for the process to leave before cleanup, so the transcript is on disk.
+    quit_claude_gracefully(&pane).await;
+
     owned.cleanup().await?;
+
+    // Harvest the real session transcript. The `<id>.jsonl` lives under the
+    // projects config dir (outside rmux), so session teardown never touches it.
+    let (transcript_path, transcript_text) = harvest_transcript(&config.claude_session_id);
 
     Ok(RunOutcome {
         exit_reason,
@@ -336,6 +409,8 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         claude_command,
         final_visible_text,
         final_output_dir,
+        transcript_path,
+        transcript_text,
     })
 }
 
@@ -489,6 +564,30 @@ fn resolve_result_dir(result_file: &Path) -> Option<String> {
     Some(path.to_owned())
 }
 
+/// Quit the interactive Claude TUI cleanly so it flushes its session `.jsonl`
+/// transcript. Two quick Ctrl-C presses trigger the confirmed exit; we then wait
+/// (bounded) for the pane process to leave and the async writer to settle. Best
+/// effort — on timeout the caller falls back to the terminal snapshot.
+async fn quit_claude_gracefully(pane: &rmux_sdk::Pane) {
+    const QUIT_DEADLINE: Duration = Duration::from_secs(15);
+
+    let keyboard = pane.keyboard();
+    for _ in 0..2 {
+        let _ = keyboard.press("C-c").await;
+        time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let deadline = Instant::now() + QUIT_DEADLINE;
+    while Instant::now() < deadline {
+        if pane_has_exited(pane).await.unwrap_or(false) {
+            // Let the transcript writer finish its final flush before teardown.
+            time::sleep(Duration::from_millis(500)).await;
+            return;
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn pane_has_exited(pane: &rmux_sdk::Pane) -> rmux_sdk::Result<bool> {
     let info = pane.info().await?;
     let target = pane.target();
@@ -510,6 +609,7 @@ fn claude_argv(
     claude_path: &str,
     model: Option<&str>,
     permission_mode: &PermissionMode,
+    session_id: &str,
 ) -> Vec<String> {
     let mut argv = vec![
         claude_path.to_owned(),
@@ -520,6 +620,11 @@ fn claude_argv(
         "--safe-mode".to_owned(),
         "--disable-slash-commands".to_owned(),
         "--strict-mcp-config".to_owned(),
+        // Pin the session id so we can find the `<id>.jsonl` transcript on disk
+        // afterward. Interactive Claude flushes that file on graceful exit, so
+        // the runner quits Claude cleanly before tearing the session down.
+        "--session-id".to_owned(),
+        session_id.to_owned(),
         "--permission-mode".to_owned(),
         permission_mode.claude_value().to_owned(),
     ];
@@ -530,61 +635,71 @@ fn claude_argv(
     argv
 }
 
-fn write_trace(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>) -> io::Result<()> {
-    let mut lines = Vec::new();
-    lines.push(format!("timestamp={}", epoch_millis()));
-    lines.push(format!("entrypoint={ENTRYPOINT}"));
-    lines.push(format!("workspace={}", config.workspace.display()));
-    lines.push(format!("prompt_file={}", config.prompt_file.display()));
-    lines.push(format!("result_file={}", config.result_file.display()));
-    lines.push(format!("trace_file={}", config.trace_file.display()));
-    lines.push(format!("session={}", outcome.session));
-    lines.push(format!("pane={}", outcome.pane));
-    lines.push(format!(
-        "permission_mode={}",
-        config.permission_mode.claude_value()
-    ));
-    lines.push(format!(
-        "claude_command={}",
-        serde_json::to_string(&outcome.claude_command).unwrap_or_default()
-    ));
-    if let Some(rmux_bin) = &config.rmux_bin {
-        lines.push(format!("rmux_bin={rmux_bin}"));
+/// Wrap the Claude argv in `env -u …` so the nesting env vars are cleared right
+/// before Claude execs. This runs inside the rmux pane, so it strips the vars
+/// regardless of whether the pane inherited them from the runner or the daemon,
+/// letting the spawned Claude persist a normal session transcript.
+fn spawn_command(claude_argv: Vec<String>) -> Vec<String> {
+    let mut command = vec!["env".to_owned()];
+    for name in CLAUDE_NESTING_ENV {
+        command.push("-u".to_owned());
+        command.push((*name).to_owned());
     }
-    lines.push("prompt_send_event=sent_exact_prompt_file_bytes_via_bracketed_paste".to_owned());
-    lines.push("prompt_submit_event=pressed_enter_after_prompt".to_owned());
-    lines.push(format!(
-        "result_file_exists={}",
-        config.result_file.exists()
-    ));
-    if let Some(dir) = &outcome.final_output_dir {
-        lines.push(format!("final_output_dir={dir}"));
-    }
-    lines.push(format!("exit_reason={:?}", outcome.exit_reason));
-    lines.push(format!("exit_code={}", outcome.exit_reason.code()));
-    if let Some(error) = setup_error {
-        lines.push(format!("setup_error={error}"));
-    }
-    lines.push("terminal_snapshot_begin".to_owned());
-    lines.push(outcome.final_visible_text.clone());
-    lines.push("terminal_snapshot_end".to_owned());
-    lines.push(String::new());
-    fs::write(&config.trace_file, lines.join("\n"))
+    command.extend(claude_argv);
+    command
 }
 
-fn metadata_for(config: &Config, outcome: &RunOutcome) -> Metadata {
+/// Write `--transcript-file`, returning which source it captured. Prefers
+/// Claude's real `<id>.jsonl` (copied verbatim); if that was not harvested,
+/// falls back to a single JSON line wrapping the final terminal snapshot so the
+/// file is still valid JSONL. Returns `"none"` when neither is available.
+fn write_transcript_file(config: &Config, outcome: &RunOutcome) -> &'static str {
+    let (content, source) = match &outcome.transcript_text {
+        Some(text) => (text.clone(), "session_jsonl"),
+        None if !outcome.final_visible_text.is_empty() => {
+            let line = serde_json::json!({
+                "type": "terminal_snapshot",
+                "text": outcome.final_visible_text,
+            });
+            (format!("{line}\n"), "terminal_snapshot")
+        }
+        None => (String::new(), "none"),
+    };
+    let _ = fs::write(&config.transcript_file, content);
+    source
+}
+
+fn metadata_for(
+    config: &Config,
+    outcome: &RunOutcome,
+    setup_error: Option<&str>,
+    transcript_source: &'static str,
+) -> Metadata {
     Metadata {
         entrypoint: ENTRYPOINT,
+        timestamp_ms: epoch_millis(),
         workspace: path_string(&config.workspace),
-        session: outcome.session.clone(),
-        pane: outcome.pane.clone(),
+        prompt_file: path_string(&config.prompt_file),
         result_file: path_string(&config.result_file),
         result_file_exists: config.result_file.exists(),
         final_output_dir: outcome.final_output_dir.clone(),
+        session: outcome.session.clone(),
+        claude_session_id: config.claude_session_id.clone(),
+        pane: outcome.pane.clone(),
+        permission_mode: config.permission_mode.claude_value().to_owned(),
+        claude_command: outcome.claude_command.clone(),
+        rmux_bin: config.rmux_bin.clone(),
+        prompt_send_event: "sent_exact_prompt_file_bytes_via_bracketed_paste",
+        prompt_submit_event: "pressed_enter_after_prompt",
         exit_reason: outcome.exit_reason,
         exit_code: outcome.exit_reason.code(),
-        claude_command: outcome.claude_command.clone(),
-        permission_mode: config.permission_mode.claude_value().to_owned(),
+        setup_error: setup_error.map(str::to_owned),
+        transcript_file: path_string(&config.transcript_file),
+        transcript_jsonl_path: outcome
+            .transcript_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        transcript_source,
         isolation_notes: vec![
             "created an owned rmux session and cleaned up only that session".to_owned(),
             "launched Claude with cwd set to --workspace using structured argv".to_owned(),
@@ -653,6 +768,48 @@ fn epoch_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// A fresh v4-style UUID for `--session-id`. Reads the kernel UUID source (the
+/// canonical form Claude expects); falls back to a synthetic id only if that is
+/// unavailable, which does not happen on the Linux hosts this runner targets.
+fn new_uuid() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/uuid")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| format!("rmux-{}-{}", std::process::id(), epoch_millis()))
+}
+
+/// Root under which Claude stores per-project session `.jsonl` files.
+/// `CLAUDE_CONFIG_DIR` relocates it; otherwise it is `~/.claude/projects`.
+fn claude_projects_root() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(PathBuf::from(dir).join("projects"));
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude").join("projects"))
+}
+
+/// Locate and read the session transcript Claude wrote for `session_id`.
+///
+/// Claude names the file `<session_id>.jsonl` and files it under a per-cwd
+/// project directory (`projects/<munged-cwd>/`). Rather than reproduce that
+/// path munging, we scan the projects root for the uniquely named file — the
+/// run owns the id, so at most one directory holds it.
+fn harvest_transcript(session_id: &str) -> (Option<PathBuf>, Option<String>) {
+    let Some(root) = claude_projects_root() else {
+        return (None, None);
+    };
+    let file_name = format!("{session_id}.jsonl");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return (None, None);
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(&file_name);
+        if candidate.is_file() {
+            let text = fs::read_to_string(&candidate).ok();
+            return (Some(candidate), text);
+        }
+    }
+    (None, None)
 }
 
 fn resolve_executable(command: &str) -> Result<String, String> {
@@ -772,6 +929,7 @@ mod tests {
             "/usr/bin/claude",
             Some("sonnet"),
             &PermissionMode::AcceptEdits,
+            "11111111-2222-3333-4444-555555555555",
         );
         assert_eq!(argv[0], "/usr/bin/claude");
         assert!(!argv.contains(&"--bare".to_owned()));
@@ -782,6 +940,25 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
         assert!(argv.windows(2).any(|pair| pair == ["--model", "sonnet"]));
+        assert!(argv.windows(2).any(
+            |pair| pair == ["--session-id", "11111111-2222-3333-4444-555555555555"]
+        ));
+    }
+
+    #[test]
+    fn spawn_command_strips_claude_nesting_env_before_claude() {
+        let argv = claude_argv("/usr/bin/claude", None, &PermissionMode::Default, "sid");
+        let command = spawn_command(argv.clone());
+        assert_eq!(command[0], "env");
+        // Every nesting var is unset via a `-u NAME` pair ahead of the binary.
+        for name in CLAUDE_NESTING_ENV {
+            assert!(command
+                .windows(2)
+                .any(|pair| pair == ["-u", *name]));
+        }
+        // The Claude argv is preserved intact after the `env` prefix.
+        let claude_start = command.iter().position(|arg| arg == "/usr/bin/claude").unwrap();
+        assert_eq!(&command[claude_start..], argv.as_slice());
     }
 
     #[test]
@@ -791,6 +968,7 @@ mod tests {
             prompt_file: PathBuf::from("/tmp/prompt"),
             result_file: PathBuf::from("/tmp/result"),
             trace_file: PathBuf::from("/tmp/trace"),
+            transcript_file: PathBuf::from("/tmp/trace.jsonl"),
             timeout: Duration::from_secs(1),
             model: None,
             session_name: "s".to_owned(),
@@ -798,6 +976,7 @@ mod tests {
             rmux_bin: None,
             final_message_file: None,
             permission_mode: PermissionMode::Default,
+            claude_session_id: "test-session-id".to_owned(),
         };
         let outcome = RunOutcome {
             exit_reason: ExitReason::Timeout,
@@ -806,13 +985,42 @@ mod tests {
             claude_command: vec!["claude".to_owned()],
             final_visible_text: String::new(),
             final_output_dir: None,
+            transcript_path: None,
+            transcript_text: None,
         };
-        let value = serde_json::to_value(metadata_for(&config, &outcome)).unwrap();
+        let value =
+            serde_json::to_value(metadata_for(&config, &outcome, None, "none")).unwrap();
         assert_eq!(value["entrypoint"], ENTRYPOINT);
         assert_eq!(value["exit_code"], 2);
         assert_eq!(value["permission_mode"], "default");
         assert_eq!(value["result_file_exists"], false);
         assert_eq!(value["final_output_dir"], serde_json::Value::Null);
+        assert_eq!(value["claude_session_id"], "test-session-id");
+        assert_eq!(value["transcript_jsonl_path"], serde_json::Value::Null);
+        assert_eq!(value["transcript_file"], "/tmp/trace.jsonl");
+        assert_eq!(value["transcript_source"], "none");
+        assert_eq!(value["setup_error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn transcript_file_defaults_beside_trace_file() {
+        let cli = Cli::try_parse_from([
+            "runner",
+            "--workspace",
+            "/tmp",
+            "--prompt-file",
+            "/etc/hostname",
+            "--result-file",
+            "/tmp/result",
+            "--trace-file",
+            "/tmp/meta.json",
+            "--timeout-seconds",
+            "60",
+        ])
+        .unwrap();
+        assert!(cli.transcript_file.is_none());
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.transcript_file, PathBuf::from("/tmp/trace.jsonl"));
     }
 
     #[test]
@@ -928,7 +1136,7 @@ mod tests {
     #[test]
     fn prompt_with_shell_metacharacters_is_not_in_argv() {
         let prompt = std::ffi::OsString::from("hello ' ; $(rm -rf /)\nnext");
-        let argv = claude_argv("claude", None, &PermissionMode::Default);
+        let argv = claude_argv("claude", None, &PermissionMode::Default, "sid");
         assert!(!argv.iter().any(|arg| arg == &prompt.to_string_lossy()));
     }
 }
