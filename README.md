@@ -40,18 +40,20 @@ Useful options:
 
 Exit codes:
 
-- `0`: `--result-file` exists and its trimmed contents name a path that exists on disk.
-- `1`: Claude pane/process exited before a valid result marker appeared.
+- `0`: `--result-file` exists with non-whitespace content (the agent finished and wrote it).
+- `1`: Claude pane/process exited before the result file appeared.
 - `2`: timeout.
 - `3`: setup, configuration, or validation failure.
 - `4`: interrupted or cancelled.
 
 The prompt file is sent as literal UTF-8 terminal input with no wrapper text.
-The result file is a plain-text marker: its trimmed contents are read as the
-run's final output directory. A run is complete only once that file holds a
-non-empty path that exists on disk. The resolved path is echoed back as
-`final_output_dir` in the metadata JSON and the trace. The file is never parsed
-as JSON.
+The result file is the completion marker the agent writes when it is done: the
+run is complete once the file exists with non-whitespace content. Its contents
+are the caller's contract and opaque to the runner — a bare output-dir path,
+JSON, or anything else all count. As a best effort, when the contents are a bare
+path that exists on disk that path is echoed back as `final_output_dir` in the
+metadata JSON and the trace; a structured (e.g. JSON) body simply leaves
+`final_output_dir` null.
 
 ## Trace capture
 
