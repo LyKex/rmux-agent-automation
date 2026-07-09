@@ -34,7 +34,6 @@ Useful options:
 --claude-bin <path-or-command>
 --rmux-bin <path-or-command>
 --transcript-file /abs/path/to/run/trace.jsonl
---final-message-file /abs/path/to/run/final_message.txt
 --permission-mode acceptEdits|bypassPermissions|default
 ```
 
@@ -50,10 +49,8 @@ The prompt file is sent as literal UTF-8 terminal input with no wrapper text.
 The result file is the completion marker the agent writes when it is done: the
 run is complete once the file exists with non-whitespace content. Its contents
 are the caller's contract and opaque to the runner — a bare output-dir path,
-JSON, or anything else all count. As a best effort, when the contents are a bare
-path that exists on disk that path is echoed back as `final_output_dir` in the
-metadata JSON and the trace; a structured (e.g. JSON) body simply leaves
-`final_output_dir` null.
+JSON, or anything else all count. The runner does not interpret or echo the
+contents; the caller reads its own result from that file.
 
 ## Trace capture
 
@@ -61,8 +58,8 @@ Each run emits **two artifacts**:
 
 1. **Metadata** (`--trace-file`) — one JSON object with the full run record:
    session, `claude_session_id`, `claude_command`, `permission_mode`,
-   `exit_reason`/`exit_code`, resolved `final_output_dir`, timestamps, and the
-   `transcript_*` fields below. This is the **same object printed to stdout** —
+   `exit_reason`/`exit_code`, timestamps, and the `transcript_*` fields below.
+   This is the **same object printed to stdout** —
    the file just persists it, so you no longer need to capture stdout separately.
 2. **Transcript** (`--transcript-file`, default `trace.jsonl` beside the
    metadata file) — the **real Claude session transcript**, a valid `.jsonl` of
