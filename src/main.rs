@@ -66,8 +66,6 @@ struct Cli {
     claude_bin: String,
     #[arg(long)]
     rmux_bin: Option<String>,
-    #[arg(long)]
-    final_message_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = PermissionMode::AcceptEdits)]
     permission_mode: PermissionMode,
 }
@@ -126,7 +124,6 @@ struct Config {
     session_name: String,
     claude_bin: String,
     rmux_bin: Option<String>,
-    final_message_file: Option<PathBuf>,
     permission_mode: PermissionMode,
     // Session id we force on Claude with `--session-id`, so we can locate the
     // exact `<id>.jsonl` transcript it writes under the projects config dir.
@@ -154,12 +151,6 @@ impl Config {
                 ensure_directory(parent, "--transcript-file parent")?;
             }
         }
-        if let Some(path) = &cli.final_message_file {
-            if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
-                ensure_directory(parent, "--final-message-file parent")?;
-            }
-        }
-
         let trace_file = absolutize_maybe_missing(cli.trace_file)?;
         // Default the transcript beside the metadata file so a single --trace-file
         // still yields both artifacts.
@@ -182,10 +173,6 @@ impl Config {
             session_name: cli.session_name.unwrap_or_else(unique_session_name),
             claude_bin: cli.claude_bin,
             rmux_bin: cli.rmux_bin,
-            final_message_file: cli
-                .final_message_file
-                .map(absolutize_maybe_missing)
-                .transpose()?,
             permission_mode: cli.permission_mode,
             claude_session_id: new_uuid(),
         })
@@ -198,8 +185,10 @@ struct RunOutcome {
     session: String,
     pane: String,
     claude_command: Vec<String>,
+    // Final terminal snapshot. Not a reported output — kept only as the transcript
+    // fallback when the real `<id>.jsonl` could not be harvested (see
+    // `write_transcript_file`).
     final_visible_text: String,
-    final_output_dir: Option<String>,
     // Real Claude session transcript, harvested from `<id>.jsonl` after the run.
     // `None` when the file could not be located/read (trace falls back to the
     // terminal snapshot).
@@ -245,7 +234,6 @@ struct Metadata {
     prompt_file: String,
     result_file: String,
     result_file_exists: bool,
-    final_output_dir: Option<String>,
     session: String,
     claude_session_id: String,
     pane: String,
@@ -299,7 +287,6 @@ async fn main() -> ExitCode {
                 pane: "0:0".to_owned(),
                 claude_command: Vec::new(),
                 final_visible_text: String::new(),
-                final_output_dir: None,
                 transcript_path: None,
                 transcript_text: None,
             };
@@ -316,10 +303,6 @@ async fn main() -> ExitCode {
 /// Write all run artifacts: the transcript `.jsonl` copy, then the merged
 /// metadata JSON — printed to stdout and written verbatim to `--trace-file`.
 fn emit(config: &Config, outcome: &RunOutcome, setup_error: Option<&str>) {
-    if let Some(path) = &config.final_message_file {
-        let _ = fs::write(path, &outcome.final_visible_text);
-    }
-
     let transcript_source = write_transcript_file(config, outcome);
     let metadata = metadata_for(config, outcome, setup_error, transcript_source);
     match serde_json::to_string(&metadata) {
@@ -394,8 +377,6 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         .await
         .map(|snapshot| snapshot.visible_text())
         .unwrap_or_default();
-    let final_output_dir = resolve_result_dir(&config.result_file);
-
     // Interactive Claude flushes its `<id>.jsonl` transcript on graceful exit,
     // not on the SIGKILL that session teardown delivers. Quit Claude cleanly and
     // wait for the process to leave before cleanup, so the transcript is on disk.
@@ -413,7 +394,6 @@ async fn run(config: &Config) -> Result<RunOutcome, Box<dyn Error>> {
         pane: "0:0".to_owned(),
         claude_command,
         final_visible_text,
-        final_output_dir,
         transcript_path,
         transcript_text,
     })
@@ -564,19 +544,6 @@ fn result_is_complete(result_file: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Best-effort read of a final output directory recorded in the result file, for
-/// the emitted metadata only — this no longer gates completion (see
-/// [`result_is_complete`]). Returns the trimmed contents when they name a path
-/// that exists on disk; `None` otherwise (e.g. a structured/JSON result file).
-fn resolve_result_dir(result_file: &Path) -> Option<String> {
-    let contents = fs::read_to_string(result_file).ok()?;
-    let path = contents.trim();
-    if path.is_empty() || !Path::new(path).exists() {
-        return None;
-    }
-    Some(path.to_owned())
-}
-
 /// Quit the interactive Claude TUI cleanly so it flushes its session `.jsonl`
 /// transcript. Two quick Ctrl-C presses trigger the confirmed exit; we then wait
 /// (bounded) for the pane process to leave and the async writer to settle. Best
@@ -695,7 +662,6 @@ fn metadata_for(
         prompt_file: path_string(&config.prompt_file),
         result_file: path_string(&config.result_file),
         result_file_exists: config.result_file.exists(),
-        final_output_dir: outcome.final_output_dir.clone(),
         session: outcome.session.clone(),
         claude_session_id: config.claude_session_id.clone(),
         pane: outcome.pane.clone(),
@@ -906,8 +872,6 @@ mod tests {
             "/bin/claude",
             "--rmux-bin",
             "/bin/rmux",
-            "--final-message-file",
-            "/tmp/final",
             "--permission-mode",
             "bypassPermissions",
         ])
@@ -987,7 +951,6 @@ mod tests {
             session_name: "s".to_owned(),
             claude_bin: "claude".to_owned(),
             rmux_bin: None,
-            final_message_file: None,
             permission_mode: PermissionMode::Default,
             claude_session_id: "test-session-id".to_owned(),
         };
@@ -997,7 +960,6 @@ mod tests {
             pane: "0:0".to_owned(),
             claude_command: vec!["claude".to_owned()],
             final_visible_text: String::new(),
-            final_output_dir: None,
             transcript_path: None,
             transcript_text: None,
         };
@@ -1007,7 +969,10 @@ mod tests {
         assert_eq!(value["exit_code"], 2);
         assert_eq!(value["permission_mode"], "default");
         assert_eq!(value["result_file_exists"], false);
-        assert_eq!(value["final_output_dir"], serde_json::Value::Null);
+        assert!(
+            value.get("final_output_dir").is_none(),
+            "final_output_dir was dropped from the metadata"
+        );
         assert_eq!(value["claude_session_id"], "test-session-id");
         assert_eq!(value["transcript_jsonl_path"], serde_json::Value::Null);
         assert_eq!(value["transcript_file"], "/tmp/trace.jsonl");
@@ -1143,17 +1108,9 @@ mod tests {
         fs::write(&result_file, [0x20, 0xff, 0x0a]).unwrap();
         assert!(result_is_complete(&result_file));
 
-        // Bare existing path → still complete, and resolvable for the metadata.
+        // Bare existing path → still complete.
         fs::write(&result_file, format!("{}\n", dir.display())).unwrap();
         assert!(result_is_complete(&result_file));
-        assert_eq!(
-            resolve_result_dir(&result_file).as_deref(),
-            Some(dir.to_string_lossy().as_ref())
-        );
-
-        // A JSON body is not a resolvable dir → best-effort resolve yields None.
-        fs::write(&result_file, "{ \"a\": 1 }").unwrap();
-        assert_eq!(resolve_result_dir(&result_file), None);
 
         fs::remove_dir_all(&dir).unwrap();
     }
