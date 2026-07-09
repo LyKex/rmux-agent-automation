@@ -9,6 +9,12 @@ readme = "README.md"
 keywords = ["claude", "rmux", "agent", "automation", "benchmark"]
 categories = ["command-line-utilities"]
 
+# Optimize the installed binary (`cargo install` builds in release).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rmux-sdk = "0.5"
