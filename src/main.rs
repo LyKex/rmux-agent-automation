@@ -41,6 +41,11 @@ struct Cli {
     workspace: PathBuf,
     #[arg(long)]
     prompt_file: PathBuf,
+    /// File the agent writes when it finishes; its existence (with non-whitespace
+    /// content) signals completion. Contents are the caller's contract and opaque
+    /// to the runner — a bare output-dir path, JSON, or anything else. When it
+    /// holds a bare existing path, that path is recorded in the metadata as a
+    /// best effort.
     #[arg(long)]
     result_file: PathBuf,
     /// Merged run metadata, written as the same JSON object printed to stdout.
@@ -546,15 +551,23 @@ async fn wait_for_completion(
     }
 }
 
-/// The result file is a plain-text marker whose trimmed contents name the run's
-/// final output directory. A run counts as complete only when that file exists,
-/// holds a non-empty path, and that path exists on disk.
+/// The run is complete once the agent has created a non-empty result-file. Its
+/// contents are the caller's contract and opaque to the runner — we detect only
+/// that the file exists and holds more than whitespace. The non-empty guard
+/// rejects a zero-byte or not-yet-written create that precedes the real write. A
+/// bare path, a JSON document, or any other body all count as complete.
 fn result_is_complete(result_file: &Path) -> bool {
-    resolve_result_dir(result_file).is_some()
+    // Read raw bytes, not UTF-8: the contents are opaque, so a non-UTF-8 body is
+    // still a valid completion marker. Complete iff any byte is non-whitespace.
+    fs::read(result_file)
+        .map(|bytes| bytes.iter().any(|b| !b.is_ascii_whitespace()))
+        .unwrap_or(false)
 }
 
-/// Read the final output directory recorded in the result file, returning it
-/// only when the file holds a non-empty path that exists on disk.
+/// Best-effort read of a final output directory recorded in the result file, for
+/// the emitted metadata only — this no longer gates completion (see
+/// [`result_is_complete`]). Returns the trimmed contents when they name a path
+/// that exists on disk; `None` otherwise (e.g. a structured/JSON result file).
 fn resolve_result_dir(result_file: &Path) -> Option<String> {
     let contents = fs::read_to_string(result_file).ok()?;
     let path = contents.trim();
@@ -1102,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn result_is_complete_requires_existing_path_in_file() {
+    fn result_is_complete_keys_on_nonempty_existence() {
         let dir = env::temp_dir().join(format!(
             "claude-rmux-result-{}-{}",
             std::process::id(),
@@ -1111,24 +1124,36 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let result_file = dir.join("agent_result.txt");
 
-        // Missing file.
+        // Missing file → not complete.
         assert!(!result_is_complete(&result_file));
 
-        // Empty / whitespace-only content.
+        // Empty / whitespace-only → not complete (guards a pre-write create).
         fs::write(&result_file, "   \n").unwrap();
         assert!(!result_is_complete(&result_file));
 
-        // Path that does not exist.
+        // Bare path that does not exist → complete: contents are opaque now.
         fs::write(&result_file, "/no/such/path/at/all").unwrap();
-        assert!(!result_is_complete(&result_file));
+        assert!(result_is_complete(&result_file));
 
-        // Non-empty path that exists (the temp dir itself).
+        // Structured (JSON) result file → complete.
+        fs::write(&result_file, "{\n  \"final_output_dir\": \"/x\"\n}\n").unwrap();
+        assert!(result_is_complete(&result_file));
+
+        // Non-UTF-8 body with a non-whitespace byte → complete (contents opaque).
+        fs::write(&result_file, [0x20, 0xff, 0x0a]).unwrap();
+        assert!(result_is_complete(&result_file));
+
+        // Bare existing path → still complete, and resolvable for the metadata.
         fs::write(&result_file, format!("{}\n", dir.display())).unwrap();
         assert!(result_is_complete(&result_file));
         assert_eq!(
             resolve_result_dir(&result_file).as_deref(),
             Some(dir.to_string_lossy().as_ref())
         );
+
+        // A JSON body is not a resolvable dir → best-effort resolve yields None.
+        fs::write(&result_file, "{ \"a\": 1 }").unwrap();
+        assert_eq!(resolve_result_dir(&result_file), None);
 
         fs::remove_dir_all(&dir).unwrap();
     }
